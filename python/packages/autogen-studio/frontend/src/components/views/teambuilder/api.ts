@@ -45,14 +45,16 @@ export class TeamAPI extends BaseAPI {
     return data.data;
   }
 
-  async createTeam(teamData: Partial<Team>, userId: string): Promise<Team> {
+  async createTeam(teamData: Partial<Team>, _userId: string): Promise<Team> {
     const team = {
-      ...teamData,
-      user_id: userId,
+      component: teamData.component,
     };
 
-    const response = await fetch(`${this.getBaseUrl()}/teams/`, {
-      method: "POST",
+    const isUpdate = teamData.id !== undefined;
+    const path = isUpdate ? `/teams/${teamData.id}` : "/teams/";
+
+    const response = await fetch(`${this.getBaseUrl()}${path}`, {
+      method: isUpdate ? "PUT" : "POST",
       headers: this.getHeaders(),
       body: JSON.stringify(team),
     });

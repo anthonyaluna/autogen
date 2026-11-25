@@ -179,10 +179,16 @@ class DatabaseManager:
 
         with Session(self.engine) as session:
             try:
-                existing_model = session.exec(select(model_class).where(model_class.id == model.id)).first()
+                existing_model = None
+                if model.id is not None:
+                    existing_model = session.exec(select(model_class).where(model_class.id == model.id)).first()
                 if existing_model:
+                    if existing_model.user_id != model.user_id:
+                        raise ValueError("Cannot change entity ownership")
                     model.updated_at = datetime.now()
-                    for key, value in model.model_dump().items():
+                    for key, value in model.model_dump(
+                        exclude={"id", "user_id", "created_at"}
+                    ).items():
                         setattr(existing_model, key, value)
                     model = existing_model
                     session.add(model)
@@ -197,13 +203,75 @@ class DatabaseManager:
 
         return Response(
             message=(
-                f"{model_class.__name__} Updated Successfully"
-                if existing_model
-                else f"{model_class.__name__} Created Successfully"
+                (
+                    f"{model_class.__name__} Updated Successfully"
+                    if existing_model
+                    else f"{model_class.__name__} Created Successfully"
+                )
+                if status
+                else f"Failed to update/create {model_class.__name__}"
             ),
             status=status,
             data=model.model_dump() if return_json else model,
         )
+
+    def create_owned(self, model: BaseDBModel, user_id: str, return_json: bool = True) -> Response:
+        """Create an entity owned by a trusted authenticated user."""
+        status = True
+        model_class = type(model)
+        model.id = None
+        model.user_id = user_id
+
+        with Session(self.engine) as session:
+            try:
+                session.add(model)
+                session.commit()
+                session.refresh(model)
+            except Exception as e:
+                session.rollback()
+                logger.error("Error while creating " + str(model_class.__name__) + ": " + str(e))
+                status = False
+
+        return Response(
+            message=(
+                f"{model_class.__name__} Created Successfully"
+                if status
+                else f"Failed to create {model_class.__name__}"
+            ),
+            status=status,
+            data=model.model_dump() if return_json else model,
+        )
+
+    def update_owned(self, model: BaseDBModel, user_id: str, return_json: bool = True) -> Response:
+        """Update an entity only when its stored owner matches the authenticated user."""
+        model_class = type(model)
+        if model.id is None:
+            return Response(message=f"{model_class.__name__} ID is required", status=False, data=None)
+
+        with Session(self.engine) as session:
+            try:
+                existing_model = session.exec(
+                    select(model_class).where(model_class.id == model.id, model_class.user_id == user_id)
+                ).first()
+                if existing_model is None:
+                    return Response(message=f"{model_class.__name__} not found", status=False, data=None)
+
+                model.updated_at = datetime.now()
+                for key, value in model.model_dump(exclude={"id", "user_id", "created_at"}).items():
+                    setattr(existing_model, key, value)
+
+                session.add(existing_model)
+                session.commit()
+                session.refresh(existing_model)
+                return Response(
+                    message=f"{model_class.__name__} Updated Successfully",
+                    status=True,
+                    data=existing_model.model_dump() if return_json else existing_model,
+                )
+            except Exception as e:
+                session.rollback()
+                logger.error("Error while updating " + str(model_class.__name__) + ": " + str(e))
+                return Response(message=f"Error while updating {model_class.__name__}", status=False, data=None)
 
     def _model_to_dict(self, model_obj):
         return {col.name: getattr(model_obj, col.name) for col in model_obj.__table__.columns}
