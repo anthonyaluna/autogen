@@ -3,22 +3,38 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
+from pydantic import BaseModel, ConfigDict
 
-from ...datamodel import Message, Response, Run, Session
-from ..deps import get_db
+from ...datamodel import Message, Response, Run, Session, Team
+from ..deps import get_current_user, get_db
 
 router = APIRouter()
 
 
+class SessionRequest(BaseModel):
+    team_id: int | None = None
+    name: str | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+def _require_owned_team(team_id: int | None, user_id: str, db) -> None:
+    if team_id is None:
+        return
+    team = db.get(Team, filters={"id": team_id, "user_id": user_id}, return_json=False)
+    if not team.status or not team.data:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+
 @router.get("/")
-async def list_sessions(user_id: str, db=Depends(get_db)) -> Dict:
+async def list_sessions(user_id: str = Depends(get_current_user), db=Depends(get_db)) -> Dict:
     """List all sessions for a user"""
     response = db.get(Session, filters={"user_id": user_id})
     return {"status": True, "data": response.data}
 
 
 @router.get("/{session_id}")
-async def get_session(session_id: int, user_id: str, db=Depends(get_db)) -> Dict:
+async def get_session(session_id: int, user_id: str = Depends(get_current_user), db=Depends(get_db)) -> Dict:
     """Get a specific session"""
     response = db.get(Session, filters={"id": session_id, "user_id": user_id})
     if not response.status or not response.data:
@@ -27,10 +43,13 @@ async def get_session(session_id: int, user_id: str, db=Depends(get_db)) -> Dict
 
 
 @router.post("/")
-async def create_session(session: Session, db=Depends(get_db)) -> Response:
+async def create_session(
+    session: SessionRequest, user_id: str = Depends(get_current_user), db=Depends(get_db)
+) -> Response:
     """Create a new session"""
     try:
-        response = db.upsert(session)
+        _require_owned_team(session.team_id, user_id, db)
+        response = db.create_owned(Session(team_id=session.team_id, name=session.name), user_id)
         if not response.status:
             return Response(status=False, message=f"Failed to create session: {response.message}")
         return Response(status=True, data=response.data, message="Session created successfully")
@@ -40,30 +59,32 @@ async def create_session(session: Session, db=Depends(get_db)) -> Response:
 
 
 @router.put("/{session_id}")
-async def update_session(session_id: int, user_id: str, session: Session, db=Depends(get_db)) -> Dict:
+async def update_session(
+    session_id: int,
+    session: SessionRequest,
+    user_id: str = Depends(get_current_user),
+    db=Depends(get_db),
+) -> Dict:
     """Update an existing session"""
-    # First verify the session belongs to user
-    existing = db.get(Session, filters={"id": session_id, "user_id": user_id})
-    if not existing.status or not existing.data:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # Update the session
-    response = db.upsert(session)
+    _require_owned_team(session.team_id, user_id, db)
+    response = db.update_owned(Session(id=session_id, team_id=session.team_id, name=session.name), user_id)
     if not response.status:
-        raise HTTPException(status_code=400, detail=response.message)
+        raise HTTPException(status_code=404, detail="Session not found")
 
     return {"status": True, "data": response.data, "message": "Session updated successfully"}
 
 
 @router.delete("/{session_id}")
-async def delete_session(session_id: int, user_id: str, db=Depends(get_db)) -> Dict:
+async def delete_session(session_id: int, user_id: str = Depends(get_current_user), db=Depends(get_db)) -> Dict:
     """Delete a session"""
     db.delete(filters={"id": session_id, "user_id": user_id}, model_class=Session)
     return {"status": True, "message": "Session deleted successfully"}
 
 
 @router.get("/{session_id}/runs")
-async def list_session_runs(session_id: int, user_id: str, db=Depends(get_db)) -> Dict:
+async def list_session_runs(
+    session_id: int, user_id: str = Depends(get_current_user), db=Depends(get_db)
+) -> Dict:
     """Get complete session history organized by runs"""
 
     try:
@@ -75,7 +96,9 @@ async def list_session_runs(session_id: int, user_id: str, db=Depends(get_db)) -
             raise HTTPException(status_code=404, detail="Session not found or access denied")
 
         # 2. Get ordered runs for session
-        runs = db.get(Run, filters={"session_id": session_id}, order="asc", return_json=False)
+        runs = db.get(
+            Run, filters={"session_id": session_id, "user_id": user_id}, order="asc", return_json=False
+        )
         if not runs.status:
             raise HTTPException(status_code=500, detail="Database error while fetching runs")
 

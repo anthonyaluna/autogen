@@ -181,7 +181,7 @@ class WebSocketManager:
                 session_id=run.session_id,
                 run_id=run_id,
                 config=self._convert_images_in_dict(message.model_dump()),
-                user_id=None,  # You might want to pass this from somewhere
+                user_id=run.user_id,
             )
             self.db_manager.upsert(db_message)
 

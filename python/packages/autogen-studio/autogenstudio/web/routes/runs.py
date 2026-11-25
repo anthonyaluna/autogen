@@ -2,41 +2,41 @@
 from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ...datamodel import Message, Run, RunStatus, Session
-from ..deps import get_db
+from ..deps import get_current_user, get_db
 
 router = APIRouter()
 
 
 class CreateRunRequest(BaseModel):
     session_id: int
-    user_id: str
+
+    model_config = ConfigDict(extra="ignore")
 
 
 @router.post("/")
 async def create_run(
     request: CreateRunRequest,
+    user_id: str = Depends(get_current_user),
     db=Depends(get_db),
 ) -> Dict:
     """Create a new run with initial state"""
-    session_response = db.get(
-        Session, filters={"id": request.session_id, "user_id": request.user_id}, return_json=False
-    )
+    session_response = db.get(Session, filters={"id": request.session_id, "user_id": user_id}, return_json=False)
     if not session_response.status or not session_response.data:
         raise HTTPException(status_code=404, detail="Session not found")
 
     try:
         # Create run with default state
-        run = db.upsert(
+        run = db.create_owned(
             Run(
                 session_id=request.session_id,
                 status=RunStatus.CREATED,
-                user_id=request.user_id,
                 task={},  # Will be set when run starts
                 team_result={},
             ),
+            user_id,
             return_json=False,
         )
         return {"status": run.status, "data": {"run_id": run.data.id}}
@@ -48,9 +48,9 @@ async def create_run(
 
 
 @router.get("/{run_id}")
-async def get_run(run_id: int, db=Depends(get_db)) -> Dict:
+async def get_run(run_id: int, user_id: str = Depends(get_current_user), db=Depends(get_db)) -> Dict:
     """Get run details including task and result"""
-    run = db.get(Run, filters={"id": run_id}, return_json=False)
+    run = db.get(Run, filters={"id": run_id, "user_id": user_id}, return_json=False)
     if not run.status or not run.data:
         raise HTTPException(status_code=404, detail="Run not found")
 
@@ -58,8 +58,12 @@ async def get_run(run_id: int, db=Depends(get_db)) -> Dict:
 
 
 @router.get("/{run_id}/messages")
-async def get_run_messages(run_id: int, db=Depends(get_db)) -> Dict:
+async def get_run_messages(run_id: int, user_id: str = Depends(get_current_user), db=Depends(get_db)) -> Dict:
     """Get all messages for a run"""
+    run = db.get(Run, filters={"id": run_id, "user_id": user_id}, return_json=False)
+    if not run.status or not run.data:
+        raise HTTPException(status_code=404, detail="Run not found")
+
     messages = db.get(Message, filters={"run_id": run_id}, order="asc", return_json=False)
 
     return {"status": True, "data": messages.data}
