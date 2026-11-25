@@ -1,8 +1,10 @@
 # api/routes/settings.py
+from collections import Counter
 from typing import Any, Dict
 
+from autogen_core import ComponentModel
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 from ...datamodel import Settings, SettingsConfig
 from ..deps import get_current_user, get_db
@@ -47,27 +49,58 @@ def _redact_secrets(value: Any) -> Any:
     return value
 
 
-def _restore_redacted_secrets(value: Any, stored: Any) -> Any:
-    value = _to_plain_value(value)
-    stored = _to_plain_value(stored)
-    if value == REDACTED_SECRET:
-        return stored
+def _contains_mask(value: Any) -> bool:
     if isinstance(value, dict):
-        stored_dict = stored if isinstance(stored, dict) else {}
-        return {key: _restore_redacted_secrets(item, stored_dict.get(key)) for key, item in value.items()}
+        return any(_contains_mask(item) for item in value.values())
     if isinstance(value, list):
-        stored_list = stored if isinstance(stored, list) else []
-        stored_by_name = {
-            item.get("name"): item for item in stored_list if isinstance(item, dict) and item.get("name") is not None
-        }
-        restored = []
-        for index, item in enumerate(value):
-            stored_item = stored_list[index] if index < len(stored_list) else None
-            if isinstance(item, dict) and item.get("name") in stored_by_name:
-                stored_item = stored_by_name[item["name"]]
-            restored.append(_restore_redacted_secrets(item, stored_item))
-        return restored
-    return value
+        return any(_contains_mask(item) for item in value)
+    return value == REDACTED_SECRET
+
+
+def _settings_config_for_write(config: SettingsConfig, stored: Any) -> Dict[str, Any]:
+    incoming = _to_plain_value(config)
+    previous = _to_plain_value(stored) or {}
+    variables = incoming["environment"]
+    previous_variables = [
+        item
+        for item in (previous.get("environment") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+    stored_counts = Counter(item.get("name") for item in previous_variables)
+    submitted_counts = Counter(item["name"] for item in variables)
+    stored_by_name = {item["name"]: item for item in previous_variables}
+
+    for variable in variables:
+        if variable["value"] != REDACTED_SECRET:
+            continue
+        name = variable["name"]
+        original = stored_by_name.get(name, {})
+        if variable["type"] != "secret":
+            if original.get("type") != "secret":
+                continue  # A public value can literally consist of eight asterisks.
+            raise HTTPException(status_code=422, detail="Re-enter the value when changing a secret variable's type.")
+        if (
+            stored_counts[name] != 1
+            or submitted_counts[name] != 1
+            or original.get("type") != "secret"
+            or original.get("value") is None
+        ):
+            raise HTTPException(status_code=422, detail="Re-enter the value for the changed environment variable.")
+        variable["value"] = original["value"]
+
+    model = incoming.get("default_model_client")
+    previous_model = previous.get("default_model_client")
+    if _contains_mask(model):
+        # Provider configurations are opaque. Even a nested edit can select a different credential destination.
+        detail = "Re-enter masked credentials when editing the model client."
+        try:
+            original_component = ComponentModel.model_validate(previous_model).model_dump()
+        except ValidationError:
+            raise HTTPException(status_code=422, detail=detail) from None
+        if model != _redact_secrets(original_component):
+            raise HTTPException(status_code=422, detail=detail)
+        incoming["default_model_client"] = original_component
+    return incoming
 
 
 def _settings_response(settings: Settings) -> Dict[str, Any]:
@@ -107,14 +140,15 @@ async def update_settings(
 
     if existing.data:
         current = existing.data[0]
-        config = _restore_redacted_secrets(settings.config, current.config)
+        config = _settings_config_for_write(settings.config, current.config)
         response = db.update_owned(
             Settings(id=current.id, config=_to_plain_value(SettingsConfig(**config))),
             user_id,
             return_json=False,
         )
     else:
-        response = db.create_owned(Settings(config=_to_plain_value(settings.config)), user_id, return_json=False)
+        config = _settings_config_for_write(settings.config, None)
+        response = db.create_owned(Settings(config=config), user_id, return_json=False)
 
     if not response.status:
         raise HTTPException(status_code=400, detail=response.message)

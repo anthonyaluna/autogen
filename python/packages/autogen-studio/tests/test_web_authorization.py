@@ -258,3 +258,67 @@ async def test_owned_workflows_and_secret_redaction(authorization_db: DatabaseMa
     stored_config = stored.config if isinstance(stored.config, SettingsConfig) else SettingsConfig(**stored.config)
     assert stored_config.environment[0].value == "persisted-secret"
     assert stored_config.ui.show_llm_call_events is True
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"name": "RENAMED"},
+        {"type": "string"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_environment_secret_edit_requires_reentry_when_identity_changes(authorization_db, changes) -> None:
+    config = SettingsConfig(environment=[EnvironmentVariable(name="SERVICE", value="fixture-secret", type="secret")])
+    _save(authorization_db, Settings(user_id=ATTACKER, config=config.model_dump(mode="json")))
+    data = (await get_settings(user_id=ATTACKER, db=authorization_db))["data"]["config"]
+    data["environment"][0].update(changes)
+
+    with pytest.raises(HTTPException) as error:
+        await update_settings(SettingsRequest(config=data), user_id=ATTACKER, db=authorization_db)
+    assert error.value.status_code == 422
+
+    data["environment"][0]["value"] = "replacement"
+    updated = await update_settings(SettingsRequest(config=data), user_id=ATTACKER, db=authorization_db)
+    expected = "replacement" if changes.get("type") == "string" else "********"
+    assert updated["data"]["config"]["environment"][0]["value"] == expected
+
+
+@pytest.mark.asyncio
+async def test_reordered_environment_secrets_keep_their_names(authorization_db) -> None:
+    config = SettingsConfig(
+        environment=[
+            EnvironmentVariable(name="FIRST", value="first-example", type="secret"),
+            EnvironmentVariable(name="SECOND", value="second-example", type="secret"),
+        ]
+    )
+    _save(authorization_db, Settings(user_id=ATTACKER, config=config.model_dump(mode="json")))
+    data = (await get_settings(user_id=ATTACKER, db=authorization_db))["data"]["config"]
+    data["environment"].reverse()
+    await update_settings(SettingsRequest(config=data), user_id=ATTACKER, db=authorization_db)
+    stored = authorization_db.get(Settings, {"user_id": ATTACKER}, return_json=False).data[0]
+    saved = SettingsConfig.model_validate(stored.config)
+    assert [(entry.name, entry.value) for entry in saved.environment] == [
+        ("SECOND", "second-example"),
+        ("FIRST", "first-example"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_change_requires_credential_reentry(authorization_db) -> None:
+    data = (await get_settings(user_id=ATTACKER, db=authorization_db))["data"]["config"]
+    component = data["default_model_client"]
+    component["config"]["api_key"] = "first-example"
+    saved = await update_settings(SettingsRequest(config=data), user_id=ATTACKER, db=authorization_db)
+    data = saved["data"]["config"]
+    assert data["default_model_client"]["config"]["api_key"] == "********"
+
+    component = data["default_model_client"]
+    component["provider"] = "example.OtherClient"
+    with pytest.raises(HTTPException) as error:
+        await update_settings(SettingsRequest(config=data), user_id=ATTACKER, db=authorization_db)
+    assert error.value.status_code == 422
+
+    component["config"]["api_key"] = "replacement-example"
+    saved = await update_settings(SettingsRequest(config=data), user_id=ATTACKER, db=authorization_db)
+    assert saved["data"]["config"]["default_model_client"]["config"]["api_key"] == "********"
